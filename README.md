@@ -1,2 +1,2 @@
-# Sentinel
-eBPF based repository
+<<<<<<< HEAD
+# SENTINEL: Linux Rootkit Detection using eBPF
