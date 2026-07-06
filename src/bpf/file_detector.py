@@ -1,356 +1,137 @@
+#!/usr/bin/python3
 from bcc import BPF
 import os
 import time
-from collections import defaultdict
+from datetime import datetime
 
-prog = """
+LOG_FILE = "/var/log/sentinel/alerts.log"
+os.makedirs("/var/log/sentinel", exist_ok=True)
+
+def log_alert(alert_type, message):
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    log_line = f"{timestamp} | FILE | {alert_type} | {message}"
+    with open(LOG_FILE, 'a') as f:
+        f.write(log_line + "\n")
+    print(log_line)
+
+ebpf_code = """
+#include <uapi/linux/ptrace.h>
 #include <linux/fs.h>
-#include <linux/sched.h>
-#include <linux/dcache.h>
 
-// Reduced structure size to fit within 512 byte stack limit
-struct file_event {
+struct file_event_t {
     u32 pid;
     char comm[16];
-    char filename[64];  // Reduced from 256
-    // Removed full_path to save stack space
+    char filename[128];
 };
 
-// Use separate map for tracking instead of stack variables
-BPF_PERF_OUTPUT(file_events);
-BPF_HASH(seen_files, u64, u32);
+BPF_PERF_OUTPUT(open_events);
 
-int trace_vfs_open(struct pt_regs *ctx, struct path *path) {
-    struct file_event event = {};
-    struct dentry *de;
-    
-    // Initialize event
+int kprobe__do_sys_open(struct pt_regs *ctx, int dfd, const char __user *filename) {
+    struct file_event_t event = {};
     event.pid = bpf_get_current_pid_tgid() >> 32;
     bpf_get_current_comm(&event.comm, sizeof(event.comm));
-    
-    // Get dentry safely
-    bpf_probe_read_kernel(&de, sizeof(de), &path->dentry);
-    if (!de) return 0;
-    
-    // Get filename with bounds checking
-    bpf_probe_read_kernel_str(&event.filename,
-                              sizeof(event.filename),
-                              (void *)&(de->d_name.name));
-    
-    // Use hash to rate limit (avoid flooding)
-    u64 pid_tgid = bpf_get_current_pid_tgid();
-    u32 *exists = seen_files.lookup(&pid_tgid);
-    if (!exists) {
-        u32 zero = 0;
-        seen_files.update(&pid_tgid, &zero);
-        file_events.perf_submit(ctx, &event, sizeof(event));
-    }
-    
+    bpf_probe_read(&event.filename, sizeof(event.filename), (void *)filename);
+    open_events.perf_submit(ctx, &event, sizeof(event));
     return 0;
 }
 """
 
-class HiddenFileDetector:
-    def __init__(self):
-        self.kernel_seen_hidden = set()
-        self.kernel_seen_all = set()
-        self.userspace_hidden = {}
-        self.suspicious_activity = defaultdict(list)
-        # Expanded watch directories
-        self.watch_dirs = ['/tmp', '/dev/shm', '/var/tmp', '/home', '/root', '/var/run']
-        self.known_safe = ['.X', '.ICE', '.Test', '.font', '.XIM', '.cache', 
-                          '.config', '.local', '.ssh', '.bashrc', '.profile',
-                          '.bash_history', '.viminfo', '.lesshst', '.mysql_history']
-        
-    def handle_event(self, cpu, data, size):
-        """Process events from eBPF"""
-        try:
-            event = b["file_events"].event(data)
-            filename = event.filename.decode('utf-8', errors='replace').strip('\x00')
-            comm = event.comm.decode('utf-8', errors='replace').strip('\x00')
-            pid = event.pid
-            
-            if not filename:
-                return
-            
-            # Track all files
-            self.kernel_seen_all.add(filename)
-            
-            # Check for hidden files (starts with .)
-            if filename.startswith('.') and len(filename) > 2 and filename not in ['.', '..']:
-                self.kernel_seen_hidden.add(filename)
-                self.suspicious_activity[filename].append({
-                    'pid': pid,
-                    'process': comm,
-                    'time': time.time(),
-                    'filename': filename
-                })
-                
-                # Keep only last 10 entries per file
-                if len(self.suspicious_activity[filename]) > 10:
-                    self.suspicious_activity[filename] = self.suspicious_activity[filename][-10:]
-                    
-        except Exception as e:
-            pass  # Silent fail for malformed events
-    
-    def scan_userspace_hidden(self):
-        """Scan directories for visible hidden files"""
-        self.userspace_hidden = {}
-        
-        for directory in self.watch_dirs:
-            if not os.path.exists(directory):
-                continue
-                
-            try:
-                visible_files = set(os.listdir(directory))
-                hidden_files = [f for f in visible_files if f.startswith('.') and len(f) > 2]
-                
-                suspicious = []
-                for hf in hidden_files:
-                    # Check if it's a known safe file
-                    is_safe = False
-                    for safe_pattern in self.known_safe:
-                        if hf.startswith(safe_pattern) or hf == safe_pattern:
-                            is_safe = True
-                            break
-                    
-                    # Also check for common safe dotfiles
-                    if not is_safe and len(hf) > 2:
-                        suspicious.append(hf)
-                
-                if suspicious:
-                    self.userspace_hidden[directory] = suspicious
-                    
-            except PermissionError:
-                continue
-            except Exception as e:
-                print(f"    [!] Error scanning {directory}: {e}")
-    
-    def detect_hidden_discrepancies(self):
-        """DETECT HIDDEN FILES - Compare kernel vs userspace"""
-        print("\n" + "="*80)
-        print("🔍 HIDDEN FILE DISCREPANCY DETECTION")
-        print("="*80)
-        
-        kernel_only_hidden = []
-        
-        # Check each hidden file kernel saw
-        for hidden_file in self.kernel_seen_hidden:
-            found_in_userspace = False
-            
-            # Try to find if this file exists in any directory
-            for directory in self.watch_dirs:
-                if not os.path.exists(directory):
-                    continue
-                    
-                try:
-                    full_path = os.path.join(directory, hidden_file)
-                    # Check if file exists at all
-                    if os.path.exists(full_path):
-                        # Check if it's visible in directory listing
-                        visible = set(os.listdir(directory))
-                        if hidden_file in visible:
-                            found_in_userspace = True
-                            break
-                        else:
-                            # File exists but hidden from directory listing!
-                            kernel_only_hidden.append((hidden_file, directory, full_path))
-                            found_in_userspace = True
-                            break
-                except:
-                    pass
-            
-            # If never found in any directory
-            if not found_in_userspace:
-                kernel_only_hidden.append((hidden_file, "unknown", "unknown"))
-        
-        # Report discrepancies
-        if kernel_only_hidden:
-            print("\n⚠️  CRITICAL: Hidden files accessed by kernel but not visible in userspace!")
-            print("⚠️  Possible rootkit or file hiding detected!\n")
-            
-            for filename, directory, full_path in kernel_only_hidden[:20]:  # Limit output
-                print(f"  🕵️  {filename}")
-                if directory != "unknown":
-                    print(f"     📁 Directory: {directory}")
-                    print(f"     📍 Path: {full_path}")
-                
-                # Show which processes accessed it
-                if filename in self.suspicious_activity:
-                    print(f"     🔄 Accessed by:")
-                    for access in self.suspicious_activity[filename][-3:]:
-                        print(f"       - PID {access['pid']}: {access['process']}")
-                print()
-            
-            if len(kernel_only_hidden) > 20:
-                print(f"  ... and {len(kernel_only_hidden) - 20} more hidden files")
-        else:
-            print("\n✅ No hidden file discrepancies detected")
-        
-        return kernel_only_hidden
-    
-    def detect_kernel_hidden_files(self):
-        """Detect hidden files that kernel has accessed"""
-        print("\n" + "="*80)
-        print("🎯 KERNEL-ACCESSED HIDDEN FILES")
-        print("="*80)
-        
-        if self.kernel_seen_hidden:
-            print(f"\n⚠️  Kernel has accessed {len(self.kernel_seen_hidden)} hidden files:\n")
-            # Show most recent/suspicious ones
-            for hf in sorted(self.kernel_seen_hidden)[:30]:
-                access_count = len(self.suspicious_activity.get(hf, []))
-                print(f"  📄 {hf}")
-                if access_count > 0:
-                    print(f"     (Accessed {access_count} times)")
-            
-            if len(self.kernel_seen_hidden) > 30:
-                print(f"\n  ... and {len(self.kernel_seen_hidden) - 30} more hidden files")
-        else:
-            print("\n✅ No hidden files accessed by kernel detected")
-    
-    def detect_userspace_hidden(self):
-        """Detect hidden files visible in userspace"""
-        print("\n" + "="*80)
-        print("👁️  USERSPACE-VISIBLE HIDDEN FILES")
-        print("="*80)
-        
-        if self.userspace_hidden:
-            total_suspicious = sum(len(files) for files in self.userspace_hidden.values())
-            print(f"\n⚠️  Found {total_suspicious} suspicious hidden files in directories:\n")
-            
-            for directory, files in self.userspace_hidden.items():
-                print(f"  📁 {directory}:")
-                for filename in files[:10]:  # Limit per directory
-                    full_path = os.path.join(directory, filename)
-                    print(f"    📄 {filename}")
-                    
-                    # Check file details
-                    try:
-                        stat = os.stat(full_path)
-                        size = stat.st_size
-                        mtime = time.ctime(stat.st_mtime)
-                        print(f"       📏 Size: {size} bytes, 🕒 Modified: {mtime}")
-                    except:
-                        pass
-                
-                if len(files) > 10:
-                    print(f"    ... and {len(files) - 10} more files")
-                print()
-        else:
-            print("\n✅ No suspicious hidden files found in userspace")
-    
-    def real_time_alert(self):
-        """Check for real-time suspicious activity"""
-        if self.suspicious_activity:
-            recent_activity = []
-            current_time = time.time()
-            
-            for filename, accesses in self.suspicious_activity.items():
-                # Check for accesses in last 5 seconds
-                recent = [a for a in accesses if current_time - a['time'] <= 5]
-                if recent:
-                    recent_activity.append((filename, recent))
-            
-            if recent_activity:
-                print("\n🚨 REAL-TIME ALERT: Hidden file access detected!")
-                for filename, accesses in recent_activity:
-                    print(f"  🔥 {filename} - accessed by {accesses[0]['process']} (PID: {accesses[0]['pid']})")
-    
-    def full_scan(self):
-        """Perform complete hidden file detection"""
-        self.scan_userspace_hidden()
-        self.detect_userspace_hidden()
-        self.detect_kernel_hidden_files()
-        self.detect_hidden_discrepancies()
-        self.real_time_alert()
-        
-        # Summary
-        print("\n" + "="*80)
-        print("📊 SUMMARY")
-        print("="*80)
-        print(f"  • Kernel-accessed hidden files: {len(self.kernel_seen_hidden)}")
-        print(f"  • Userspace-visible hidden files: {sum(len(v) for v in self.userspace_hidden.values())}")
-        print(f"  • Total unique files seen by kernel: {len(self.kernel_seen_all)}")
-        print(f"  • Suspicious activities tracked: {len(self.suspicious_activity)}")
+# Paths to skip BEFORE doing any filesystem work (fast string check)
+SKIP_PREFIXES = (
+    '/proc/', '/sys/', '/dev/', '/run/', '/lib/', '/lib64/',
+    '/usr/lib/', '/usr/lib64/', '/usr/share/', '/usr/bin/',
+    '/usr/sbin/', '/bin/', '/sbin/', '/etc/ld', '/etc/ssl',
+    '/var/cache/', '/var/lib/', '/snap/',
+)
+SKIP_SUFFIXES = ('.so', '.pyc', '.cache', '.conf', '.log', '.db', '.json')
 
-print("🛡️  SENTINEL - Advanced Hidden File Detector")
-print("="*80)
-print("[✓] Using eBPF to monitor kernel-level file access")
-print("[✓] Comparing kernel view vs userspace view")
-print("[✓] Detecting hidden files and potential rootkits")
-print("[✓] Real-time suspicious activity monitoring")
-print("="*80)
+# Two caches — avoid re-checking same path repeatedly
+not_hidden_cache = set()   # paths confirmed visible → skip forever
+alerted_files    = set()   # paths already alerted → don't repeat
 
-# Initialize eBPF
-try:
-    b = BPF(text=prog)
-    b.attach_kprobe(event="vfs_open", fn_name="trace_vfs_open")
-    print("[✓] eBPF program loaded successfully")
-except Exception as e:
-    print(f"[✗] Failed to load eBPF: {e}")
-    print("    Make sure you have root privileges and BCC installed")
-    exit(1)
+MY_PID = os.getpid()
 
-# Initialize detector
-detector = HiddenFileDetector()
-b["file_events"].open_perf_buffer(detector.handle_event)
+def resolve_path(fname, pid):
+    if not fname:
+        return None
+    if fname.startswith('/'):
+        return fname
+    try:
+        cwd = os.readlink(f'/proc/{pid}/cwd')
+        return os.path.normpath(os.path.join(cwd, fname))
+    except Exception:
+        return None
 
-# Create test files to demonstrate detection
-print("\n[*] Creating test files for demonstration...")
-try:
-    os.system("touch /tmp/.normal_hidden_file 2>/dev/null")
-    os.system("touch /tmp/.suspicious_malware 2>/dev/null")
-    os.system("echo 'test' > /tmp/.kernel_only_file 2>/dev/null")
-    print("[✓] Test files created")
-except:
-    print("[!] Could not create test files (permission issues)")
+def is_hidden(filepath):
+    """
+    Only called for paths that passed all pre-filters and aren't cached.
+    open() works but getdents() doesn't list it → rootkit hiding it.
+    """
+    directory = os.path.dirname(filepath) or '/'
+    basename  = os.path.basename(filepath)
+    try:
+        fd = os.open(filepath, os.O_RDONLY | os.O_NONBLOCK)
+        os.close(fd)
+    except OSError:
+        not_hidden_cache.add(filepath)   # can't open → cache as safe, skip next time
+        return False
+    try:
+        if basename in os.listdir(directory):
+            not_hidden_cache.add(filepath)   # visible → cache, skip next time
+            return False
+    except Exception:
+        return False
+    return True
 
-# Access the test file so kernel sees it
-try:
-    with open('/tmp/.kernel_only_file', 'r') as f:
+def handle_event(cpu, data, size):
+    try:
+        event     = b["open_events"].event(data)
+        raw_name  = event.filename.decode('utf-8', 'replace').strip('\x00').strip()
+        proc_name = event.comm.decode('utf-8', 'replace').strip('\x00')
+        pid_num   = event.pid
+
+        # Never inspect our own opens (would cause infinite loop)
+        if pid_num == MY_PID:
+            return
+
+        if not raw_name:
+            return
+
+        # Fast pre-filter: skip noisy paths without touching the filesystem
+        if any(raw_name.startswith(p) for p in SKIP_PREFIXES):
+            return
+        if any(raw_name.endswith(s) for s in SKIP_SUFFIXES):
+            return
+
+        filepath = resolve_path(raw_name, pid_num)
+        if not filepath:
+            return
+        if any(filepath.startswith(p) for p in SKIP_PREFIXES):
+            return
+
+        # Already alerted or confirmed not-hidden → skip with zero syscalls
+        if filepath in alerted_files or filepath in not_hidden_cache:
+            return
+
+        # Only now do the expensive hidden check
+        if is_hidden(filepath):
+            message = f"HIDDEN_FILE|{filepath}|PID={pid_num}|PROC={proc_name}"
+            log_alert("HIDDEN_FILE_ACCESS", message)
+            alerted_files.add(filepath)
+
+    except Exception:
         pass
-    with open('/tmp/.suspicious_malware', 'r') as f:
-        pass
-    print("[✓] Simulated access to test files")
-except:
-    pass
 
-print("\n[*] Monitoring for hidden file activity...")
-print("[*] Press CTRL+C to stop and see full report\n")
-print("-"*80)
+print("[*] File Detector Started (Logging to /var/log/sentinel/alerts.log)")
+print("[*] Ring buffer + path cache active — no sample loss")
 
-# Monitoring loop
-scan_counter = 0
+b = BPF(text=ebpf_code)
+b["open_events"].open_perf_buffer(handle_event, page_cnt=256)
+
 try:
     while True:
-        # Poll eBPF events with timeout
-        b.perf_buffer_poll(timeout=1000)
-        scan_counter += 1
-        
-        # Every 15 seconds, do a full scan
-        if scan_counter % 15 == 0:
-            print(f"\n[SCAN #{scan_counter//15}] Running hidden file detection...")
-            detector.full_scan()
-            print("\n" + "-"*80)
-            print("[*] Continuing monitoring (press Ctrl+C to stop)...")
-            
+        b.perf_buffer_poll(timeout=100)
 except KeyboardInterrupt:
-    print("\n\n" + "="*80)
-    print("📋 FINAL REPORT")
-    print("="*80)
-    
-    # Final comprehensive scan
-    detector.full_scan()
-    
-    # Cleanup
-    print("\n[*] Cleaning up test files...")
-    try:
-        os.remove('/tmp/.normal_hidden_file')
-        os.remove('/tmp/.suspicious_malware')
-        os.remove('/tmp/.kernel_only_file')
-        print("[✓] Test files removed")
-    except:
-        pass
-    
-    print("\n[*] SENTINEL stopped.")
+    print("\n[!] Stopping SENTINEL...")
+except Exception as e:
+    print(f"Error: {e}")
