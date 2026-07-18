@@ -45,11 +45,8 @@ SKIP_PREFIXES = (
 )
 SKIP_SUFFIXES = ('.so', '.pyc', '.cache', '.conf', '.log', '.db', '.json')
 
-# Two caches — avoid re-checking same path repeatedly
-not_hidden_cache = set()   # paths confirmed visible → skip forever
-alerted_files    = set()   # paths already alerted → don't repeat
-
 MY_PID = os.getpid()
+
 
 def resolve_path(fname, pid):
     if not fname:
@@ -62,26 +59,33 @@ def resolve_path(fname, pid):
     except Exception:
         return None
 
+
 def is_hidden(filepath):
     """
     Only called for paths that passed all pre-filters and aren't cached.
     open() works but getdents() doesn't list it → rootkit hiding it.
     """
+    # FILTER: directory opens (e.g. bash doing a PATH lookup on
+    # /usr/local/bin/, or udevd scanning /) come through with a trailing
+    # slash. That makes basename() come out empty, which never matches
+    # listdir() and falsely looks "hidden". Skip these — not a file hide.
+    if filepath.endswith('/') or filepath == '':
+        return False
+
     directory = os.path.dirname(filepath) or '/'
     basename  = os.path.basename(filepath)
     try:
         fd = os.open(filepath, os.O_RDONLY | os.O_NONBLOCK)
         os.close(fd)
     except OSError:
-        not_hidden_cache.add(filepath)   # can't open → cache as safe, skip next time
         return False
     try:
         if basename in os.listdir(directory):
-            not_hidden_cache.add(filepath)   # visible → cache, skip next time
             return False
     except Exception:
         return False
     return True
+
 
 def handle_event(cpu, data, size):
     try:
@@ -109,18 +113,14 @@ def handle_event(cpu, data, size):
         if any(filepath.startswith(p) for p in SKIP_PREFIXES):
             return
 
-        # Already alerted or confirmed not-hidden → skip with zero syscalls
-        if filepath in alerted_files or filepath in not_hidden_cache:
-            return
-
         # Only now do the expensive hidden check
         if is_hidden(filepath):
             message = f"HIDDEN_FILE|{filepath}|PID={pid_num}|PROC={proc_name}"
             log_alert("HIDDEN_FILE_ACCESS", message)
-            alerted_files.add(filepath)
 
     except Exception:
         pass
+
 
 print("[*] File Detector Started (Logging to /var/log/sentinel/alerts.log)")
 print("[*] Ring buffer + path cache active — no sample loss")
