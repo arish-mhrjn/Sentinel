@@ -682,7 +682,7 @@ HTML = '''
 
     <div class="header">
         <h1>💀 SENTINEL</h1>
-        <div class="subtitle"><span class="status-dot"></span> eBPF Real-Time Rootkit Detection | Ubuntu 20.04 | Kernel 5.4.0</div>
+        <div class="subtitle"><span class="status-dot"></span> eBPF Real-Time Rootkit Detection</div>
     </div>
 
     <div class="export-container">
