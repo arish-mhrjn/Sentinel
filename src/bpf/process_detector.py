@@ -71,6 +71,8 @@ def get_process_name(pid):
 def is_whitelisted(pid, name):
     if name in WHITELIST:
         return True
+    if name.startswith("pool-"):
+        return True
     try:
         with open(f"/proc/{pid}/cmdline", "r") as f:
             cmd = f.read().lower()
@@ -135,4 +137,3 @@ try:
 
 except KeyboardInterrupt:
     print("\n[!] Stopping SENTINEL...")
-
