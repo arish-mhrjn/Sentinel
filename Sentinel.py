@@ -8,11 +8,14 @@ import json
 import os
 import zipfile
 import secrets
+import smtplib
+from email.message import EmailMessage
 from datetime import datetime
 from io import BytesIO
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)
+
 LOG_FILE = "/var/log/sentinel/alerts.log"
 DETECTORS_DIR = "/root/sentinel/src/bpf"
 os.makedirs("/var/log/sentinel", exist_ok=True)
@@ -23,6 +26,66 @@ SENTINEL_USERNAME = "admin"
 # Generate your own: python3 -c "from werkzeug.security import generate_password_hash; print(generate_password_hash('YOUR_PASSWORD'))"
 SENTINEL_PASSWORD_HASH = "scrypt:32768:8:1$itLjDUyroGMZ4q7D$a4a5e841dd54d7fbd41b451d41dc257b5e2996d4fb63cbac58e132efb191ae5a73c1f08574f6fbff49a5d79be1405516fe7a86ab23e7e434971321f2ec994bd8"
 
+# ---- Email alert config ----
+# Configurable live from the dashboard (Settings panel). Persisted to disk so it
+# survives restarts. Environment variables are used only as the initial default
+# the first time this file is created (handy for automated/headless deploys).
+EMAIL_CONFIG_FILE = "/var/log/sentinel/email_config.json"
+email_config_lock = threading.Lock()
+
+DEFAULT_EMAIL_CONFIG = {
+    "enabled": os.environ.get("SENTINEL_EMAIL_ENABLED", "false").lower() == "true",
+    "smtp_host": os.environ.get("SENTINEL_SMTP_HOST", "smtp.gmail.com"),
+    "smtp_port": int(os.environ.get("SENTINEL_SMTP_PORT", "587")),
+    "smtp_username": os.environ.get("SENTINEL_SMTP_USERNAME", ""),
+    "smtp_password": os.environ.get("SENTINEL_SMTP_PASSWORD", ""),
+    "use_tls": os.environ.get("SENTINEL_SMTP_TLS", "true").lower() == "true",
+    "from_addr": os.environ.get("SENTINEL_ALERT_FROM", os.environ.get("SENTINEL_SMTP_USERNAME", "")),
+    "to_addrs": [a.strip() for a in os.environ.get("SENTINEL_ALERT_TO", "").split(",") if a.strip()],
+    "digest_interval": int(os.environ.get("SENTINEL_EMAIL_INTERVAL", "60")),
+    "immediate_detectors": sorted(
+        set(d.strip() for d in os.environ.get("SENTINEL_EMAIL_IMMEDIATE", "network,syscall").split(",") if d.strip())
+    ),
+}
+
+
+def load_email_config():
+    if os.path.exists(EMAIL_CONFIG_FILE):
+        try:
+            with open(EMAIL_CONFIG_FILE, 'r') as f:
+                cfg = json.load(f)
+            merged = dict(DEFAULT_EMAIL_CONFIG)
+            merged.update(cfg)
+            return merged
+        except Exception as e:
+            print(f"[!] Failed to load {EMAIL_CONFIG_FILE}, using defaults: {e}")
+    return dict(DEFAULT_EMAIL_CONFIG)
+
+
+def save_email_config(cfg):
+    os.makedirs(os.path.dirname(EMAIL_CONFIG_FILE), exist_ok=True)
+    tmp_path = EMAIL_CONFIG_FILE + ".tmp"
+    with open(tmp_path, 'w') as f:
+        json.dump(cfg, f, indent=2)
+    os.chmod(tmp_path, 0o600)  # config holds an SMTP password — keep it off-limits to other users
+    os.replace(tmp_path, EMAIL_CONFIG_FILE)
+
+
+email_config = load_email_config()
+
+
+def get_email_config():
+    with email_config_lock:
+        return dict(email_config)
+
+
+def update_email_config(updates):
+    with email_config_lock:
+        email_config.update(updates)
+        save_email_config(email_config)
+        return dict(email_config)
+
+
 def login_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -31,6 +94,7 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated
 
+
 alerts = {
     'process': [],
     'module': [],
@@ -38,10 +102,14 @@ alerts = {
     'network': [],
     'syscall': []
 }
-
 last_position = 0
 lock = threading.Lock()
 detector_processes = []
+
+# ---- Email queue state ----
+email_queue = {k: [] for k in alerts}
+email_lock = threading.Lock()
+
 
 def start_detectors():
     detectors = [
@@ -62,6 +130,7 @@ def start_detectors():
             print(f"    ✗ {script} not found")
     print("[*] All detectors started\n")
 
+
 def tail_log():
     global last_position
     while True:
@@ -78,6 +147,86 @@ def tail_log():
             pass
         time.sleep(1)
 
+
+# ---------------- Email alerting ----------------
+
+def send_email(subject, body, cfg=None):
+    """Send a single email via SMTP. Fails silently (with a log line) so a mail
+    outage never takes down alert collection or the dashboard."""
+    cfg = cfg or get_email_config()
+    if not cfg.get("enabled"):
+        return None
+    if not cfg.get("smtp_username") or not cfg.get("smtp_password") or not cfg.get("to_addrs"):
+        print("[!] Email alerts enabled but smtp_username/smtp_password/to_addrs not fully configured")
+        return "Email is enabled but SMTP username, password, or recipients are missing."
+    msg = EmailMessage()
+    msg['Subject'] = subject
+    msg['From'] = cfg.get("from_addr") or cfg.get("smtp_username")
+    msg['To'] = ", ".join(cfg.get("to_addrs", []))
+    msg.set_content(body)
+    try:
+        host, port = cfg["smtp_host"], int(cfg["smtp_port"])
+        if port == 465:
+            with smtplib.SMTP_SSL(host, port, timeout=10) as server:
+                server.login(cfg["smtp_username"], cfg["smtp_password"])
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(host, port, timeout=10) as server:
+                if cfg.get("use_tls", True):
+                    server.starttls()
+                server.login(cfg["smtp_username"], cfg["smtp_password"])
+                server.send_message(msg)
+        return None
+    except Exception as e:
+        print(f"[!] Failed to send email alert: {e}")
+        return str(e)
+
+
+def send_immediate_alert(detector, alert):
+    subject = f"[SENTINEL] CRITICAL {detector.upper()} alert"
+    body = (
+        f"SENTINEL - IMMEDIATE {detector.upper()} ALERT\n"
+        f"{'=' * 50}\n"
+        f"Time:    {alert['time']}\n"
+        f"Type:    {alert['type']}\n"
+        f"Details: {alert['details']}\n"
+    )
+    threading.Thread(target=send_email, args=(subject, body), daemon=True).start()
+
+
+def queue_email_alert(detector, alert):
+    cfg = get_email_config()
+    if not cfg.get("enabled") or not cfg.get("to_addrs"):
+        return
+    if detector in set(cfg.get("immediate_detectors", [])):
+        send_immediate_alert(detector, alert)
+        return
+    with email_lock:
+        email_queue[detector].append(alert)
+
+
+def email_digest_loop():
+    """Periodically batches up non-critical alerts into a single digest email
+    per detector, so a burst of alerts doesn't flood the inbox or trip
+    provider rate limits."""
+    while True:
+        cfg = get_email_config()
+        time.sleep(max(5, int(cfg.get("digest_interval", 60))))
+        cfg = get_email_config()
+        if not cfg.get("enabled") or not cfg.get("to_addrs"):
+            continue
+        with email_lock:
+            for detector, items in email_queue.items():
+                if not items:
+                    continue
+                subject = f"[SENTINEL] {len(items)} new {detector.upper()} alert(s)"
+                lines = [f"SENTINEL - {detector.upper()} ALERTS", "=" * 50, ""]
+                for a in items:
+                    lines.append(f"[{a['time']}] [{a['type']}] {a['details']}")
+                send_email(subject, "\n".join(lines), cfg=cfg)
+                email_queue[detector] = []
+
+
 def parse_alert(line):
     try:
         parts = line.split(' | ')
@@ -87,18 +236,22 @@ def parse_alert(line):
             alert_type = parts[2]
             details = ' | '.join(parts[3:])
             if detector in alerts:
+                alert_obj = {
+                    'time': timestamp,
+                    'type': alert_type,
+                    'details': details,
+                }
                 with lock:
-                    alerts[detector].append({
-                        'time': timestamp,
-                        'type': alert_type,
-                        'details': details,
-                    })
+                    alerts[detector].append(alert_obj)
                     if len(alerts[detector]) > 200:
                         alerts[detector] = alerts[detector][-200:]
+                queue_email_alert(detector, alert_obj)
     except:
         pass
 
+
 threading.Thread(target=tail_log, daemon=True).start()
+threading.Thread(target=email_digest_loop, daemon=True).start()
 start_detectors()
 
 LOGIN_HTML = '''
@@ -107,12 +260,12 @@ LOGIN_HTML = '''
 <head>
 <meta charset="UTF-8">
 <title>SENTINEL | Login</title>
-<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
 body {
     background: radial-gradient(ellipse at 20% 30%, #0a1519, #020a0c);
-    font-family: 'Orbitron', 'Courier New', monospace;
+    font-family: 'Space Grotesk', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     color: #00d9ff;
     display: flex;
     justify-content: center;
@@ -124,12 +277,14 @@ body {
 }
 .login-banner {
     font-size: 42px;
+    font-family: 'Space Grotesk', sans-serif;
+    font-weight: 700;
     background: linear-gradient(135deg, #00d9ff, #0088aa, #005566);
     -webkit-background-clip: text;
     background-clip: text;
     color: transparent;
     text-shadow: 0 0 30px rgba(0,217,255,0.3);
-    letter-spacing: 3px;
+    letter-spacing: 1px;
     margin-bottom: 25px;
     animation: pulse 2s ease-in-out infinite;
 }
@@ -139,45 +294,76 @@ body {
 }
 .box {
     border: 1px solid #00d9ff;
-    padding: 40px 50px;
+    padding: 45px 55px;
     border-radius: 20px;
     background: rgba(30,0,10,0.7);
     backdrop-filter: blur(10px);
     text-align: center;
     box-shadow: 0 0 30px rgba(0,217,255,0.2);
+    min-width: 340px;
 }
-.box h2 { margin-bottom: 25px; margin-top: 0; letter-spacing: 2px; font-size: 15px; color: #88bbcc; font-weight: normal; }
+.box h2 { margin-bottom: 28px; margin-top: 0; letter-spacing: 2px; font-size: 18px; color: #88bbcc; font-weight: 500; }
+form {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+}
+.field {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    text-align: left;
+}
+.field label {
+    font-size: 14px;
+    color: #66aacc;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    font-weight: 600;
+}
 input {
     background: #0a1519;
     border: 1px solid #00d9ff;
     color: #00d9ff;
-    padding: 12px;
-    margin: 8px 0;
-    border-radius: 8px;
+    padding: 14px 16px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 16px;
+    border-radius: 10px;
     width: 100%;
-    font-family: 'Orbitron', monospace;
     display: block;
+    box-sizing: border-box;
 }
 input::placeholder {
     color: #557788;
 }
 input:focus {
+    outline: none;
     border-color: #00d9ff;
     box-shadow: 0 0 15px rgba(0, 217, 255, 0.3);
 }
 button {
-    background: #00d9ff;
-    color: #0a1519;
+    background: linear-gradient(135deg, #00d9ff, #0088aa);
+    color: #041014;
     border: none;
-    padding: 12px 35px;
-    border-radius: 25px;
-    font-weight: bold;
+    padding: 15px 35px;
+    border-radius: 12px;
+    font-weight: 700;
+    font-size: 16px;
+    letter-spacing: 1px;
     cursor: pointer;
-    margin-top: 15px;
-    font-family: 'Orbitron', monospace;
+    margin-top: 8px;
+    font-family: 'Space Grotesk', sans-serif;
+    transition: all 0.2s ease;
+    box-shadow: 0 4px 15px rgba(0,217,255,0.25);
 }
-button:hover { box-shadow: 0 0 20px rgba(0,217,255,0.5); }
-.err { color: #ff4444; font-size: 12px; margin-top: 12px; }
+button:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 6px 25px rgba(0,217,255,0.5);
+}
+button:active {
+    transform: translateY(0);
+}
+.err { color: #ff4444; font-size: 14px; margin-top: 14px; }
 </style>
 </head>
 <body>
@@ -186,8 +372,14 @@ button:hover { box-shadow: 0 0 20px rgba(0,217,255,0.5); }
 <div class="box">
 <h2>LOGIN</h2>
 <form method="POST">
-<input type="text" name="username" placeholder="Username" required autofocus>
-<input type="password" name="password" placeholder="Password" required>
+<div class="field">
+<label for="username">Username</label>
+<input type="text" id="username" name="username" placeholder="Enter username" required autofocus>
+</div>
+<div class="field">
+<label for="password">Password</label>
+<input type="password" id="password" name="password" placeholder="Enter password" required>
+</div>
 <button type="submit">LOGIN</button>
 </form>
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
@@ -196,6 +388,7 @@ button:hover { box-shadow: 0 0 20px rgba(0,217,255,0.5); }
 </body>
 </html>
 '''
+
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -209,10 +402,12 @@ def login():
         error = "Invalid credentials"
     return render_template_string(LOGIN_HTML, error=error)
 
+
 @app.route('/logout')
 def logout():
     session.pop('logged_in', None)
     return redirect(url_for('login'))
+
 
 HTML = '''
 <!DOCTYPE html>
@@ -221,21 +416,19 @@ HTML = '''
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>SENTINEL | Rootkit Detection Framework</title>
-    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; user-select: none; -webkit-tap-highlight-color: transparent; }
-
         body {
             background: radial-gradient(ellipse at 20% 30%, #0a1519, #020a0c);
-            font-family: 'Orbitron', 'Courier New', monospace;
+            font-family: 'Space Grotesk', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
             min-height: 100vh;
             color: #00d9ff;
             padding: 20px;
             cursor: default;
             position: relative;
         }
-
         body::before {
             content: '';
             position: fixed;
@@ -250,7 +443,6 @@ HTML = '''
             pointer-events: none;
             z-index: 0;
         }
-
         .bg-animation {
             position: fixed;
             top: 0;
@@ -260,7 +452,6 @@ HTML = '''
             z-index: -1;
             overflow: hidden;
         }
-
         .bg-animation::before {
             content: '';
             position: absolute;
@@ -275,42 +466,38 @@ HTML = '''
             );
             animation: scan 20s linear infinite;
         }
-
         @keyframes scan {
             0% { transform: translate(0, 0); }
             100% { transform: translate(50%, 50%); }
         }
-
         .header {
             text-align: center;
             margin-bottom: 30px;
             position: relative;
             z-index: 1;
         }
-
         h1 {
             font-size: 56px;
+            font-family: 'Space Grotesk', sans-serif;
+            font-weight: 700;
             background: linear-gradient(135deg, #00d9ff, #0088aa, #005566);
             -webkit-background-clip: text;
             background-clip: text;
             color: transparent;
             text-shadow: 0 0 30px rgba(0,217,255,0.3);
-            letter-spacing: 4px;
+            letter-spacing: 1px;
             animation: pulse 2s ease-in-out infinite;
         }
-
         @keyframes pulse {
             0%, 100% { opacity: 1; text-shadow: 0 0 20px rgba(0,217,255,0.3); }
             50% { opacity: 0.9; text-shadow: 0 0 40px rgba(0,217,255,0.6); }
         }
-
         .subtitle {
             color: #66aacc;
             margin-top: 10px;
-            font-size: 14px;
+            font-size: 15px;
             letter-spacing: 2px;
         }
-
         .status-dot {
             display: inline-block;
             width: 10px;
@@ -321,12 +508,10 @@ HTML = '''
             animation: blink 1s infinite;
             margin-right: 8px;
         }
-
         @keyframes blink {
             0%, 100% { opacity: 1; }
             50% { opacity: 0.3; }
         }
-
         .stats-grid {
             display: flex;
             justify-content: center;
@@ -336,7 +521,6 @@ HTML = '''
             position: relative;
             z-index: 1;
         }
-
         .stat-card {
             background: linear-gradient(135deg, rgba(30,0,10,0.85), rgba(20,0,10,0.95));
             backdrop-filter: blur(10px);
@@ -350,7 +534,6 @@ HTML = '''
             overflow: hidden;
             cursor: pointer;
         }
-
         .stat-card::after {
             content: '';
             position: absolute;
@@ -362,21 +545,17 @@ HTML = '''
             opacity: 0;
             transition: opacity 0.3s;
         }
-
         .stat-card:hover::after {
             opacity: 1;
         }
-
         .stat-card:hover {
             transform: translateY(-3px);
             border-color: #00d9ff;
             box-shadow: 0 0 20px rgba(0,217,255,0.2);
         }
-
         .stat-icon { font-size: 28px; margin-bottom: 5px; }
-        .stat-number { font-size: 36px; font-weight: bold; color: #ffaa44; text-shadow: 0 0 5px rgba(255,170,68,0.3); }
-        .stat-label { font-size: 10px; color: #88bbcc; margin-top: 5px; text-transform: uppercase; letter-spacing: 1px; }
-
+        .stat-number { font-family: 'JetBrains Mono', monospace; font-size: 36px; font-weight: 700; color: #ffaa44; text-shadow: 0 0 5px rgba(255,170,68,0.3); }
+        .stat-label { font-size: 12px; color: #88bbcc; margin-top: 5px; text-transform: uppercase; letter-spacing: 1px; }
         .main-tab-bar {
             display: flex;
             gap: 10px;
@@ -386,49 +565,42 @@ HTML = '''
             position: relative;
             z-index: 1;
         }
-
         .main-tab {
             background: rgba(30,0,10,0.8);
             backdrop-filter: blur(5px);
             border: 1px solid rgba(0,217,255,0.3);
             padding: 12px 28px;
             border-radius: 12px;
-            font-family: 'Orbitron', monospace;
-            font-size: 14px;
-            font-weight: bold;
+            font-family: 'Space Grotesk', sans-serif;
+            font-size: 15px;
+            font-weight: 600;
             transition: all 0.3s ease;
             color: #00d9ff;
             cursor: pointer;
         }
-
         .main-tab:hover {
             transform: translateY(-2px);
             background: rgba(0,217,255,0.1);
             border-color: #00d9ff;
         }
-
         .main-tab.active {
             background: #00d9ff;
             color: #0a1519;
             box-shadow: 0 0 20px rgba(0,217,255,0.5);
         }
-
         .main-panel {
             display: none;
             position: relative;
             z-index: 1;
         }
-
         .main-panel.active {
             display: block;
             animation: fadeSlide 0.4s ease;
         }
-
         @keyframes fadeSlide {
             from { opacity: 0; transform: translateY(10px); }
             to { opacity: 1; transform: translateY(0); }
         }
-
         .dashboard-grid {
             display: flex;
             justify-content: center;
@@ -437,7 +609,6 @@ HTML = '''
             margin-bottom: 30px;
             flex-wrap: wrap;
         }
-
         .dashboard-card {
             flex: 1;
             min-width: 380px;
@@ -449,21 +620,18 @@ HTML = '''
             padding: 20px;
             transition: all 0.3s ease;
         }
-
         .dashboard-card:hover {
             border-color: rgba(0,217,255,0.5);
             box-shadow: 0 0 20px rgba(0,217,255,0.1);
         }
-
         .dashboard-card h3 {
             color: #00d9ff;
             margin-bottom: 15px;
-            font-size: 16px;
+            font-size: 17px;
             border-bottom: 1px solid rgba(0,217,255,0.3);
             padding-bottom: 10px;
             text-align: center;
         }
-
         .chart-container {
             position: relative;
             height: 280px;
@@ -473,19 +641,16 @@ HTML = '''
             justify-content: center;
             align-items: center;
         }
-
         canvas {
             max-height: 250px;
             width: auto !important;
         }
-
         .alert-cards-row {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
             gap: 15px;
             margin-bottom: 30px;
         }
-
         .alert-mini-card {
             background: rgba(30,0,10,0.5);
             backdrop-filter: blur(10px);
@@ -496,27 +661,22 @@ HTML = '''
             transition: all 0.3s ease;
             cursor: pointer;
         }
-
         .alert-mini-card:hover {
             transform: translateY(-3px);
             border-color: #00d9ff;
             background: rgba(0,217,255,0.05);
         }
-
         .alert-mini-card .icon { font-size: 28px; margin-bottom: 5px; }
         .alert-mini-card .count { font-size: 28px; font-weight: bold; color: #ffaa44; }
-        .alert-mini-card .name { font-size: 10px; color: #88bbcc; margin-top: 5px; text-transform: uppercase; }
-
+        .alert-mini-card .name { font-size: 12px; color: #88bbcc; margin-top: 5px; text-transform: uppercase; }
         .threat-stat {
             display: flex;
             justify-content: space-between;
             padding: 10px 0;
             border-bottom: 1px solid rgba(0,217,255,0.1);
         }
-
-        .threat-stat .label { color: #88bbcc; font-size: 13px; }
-        .threat-stat .value { color: #ffaa44; font-weight: bold; font-size: 18px; }
-
+        .threat-stat .label { color: #88bbcc; font-size: 14px; }
+        .threat-stat .value { font-family: 'JetBrains Mono', monospace; color: #ffaa44; font-weight: 700; font-size: 18px; }
         .alert-container {
             display: none;
             background: rgba(10,0,8,0.7);
@@ -528,12 +688,10 @@ HTML = '''
             overflow-y: auto;
             border: 1px solid rgba(0,217,255,0.2);
         }
-
         .alert-container.active {
             display: block;
             animation: fadeSlide 0.4s ease;
         }
-
         .alert-item {
             background: linear-gradient(90deg, rgba(255,0,0,0.15), rgba(255,0,0,0.05));
             border-left: 4px solid #ff0000;
@@ -544,30 +702,25 @@ HTML = '''
             box-shadow: 0 0 10px rgba(255,0,0,0.2);
             animation: redGlow 2s ease-in-out infinite;
         }
-
         @keyframes redGlow {
             0% { box-shadow: 0 0 5px rgba(255,0,0,0.2); border-left-color: #ff0000; }
             50% { box-shadow: 0 0 20px rgba(255,0,0,0.5); border-left-color: #ff4444; }
             100% { box-shadow: 0 0 5px rgba(255,0,0,0.2); border-left-color: #ff0000; }
         }
-
         .alert-item:hover {
             transform: translateX(8px);
             background: linear-gradient(90deg, rgba(255,0,0,0.25), rgba(255,0,0,0.1));
             box-shadow: 0 0 25px rgba(255,0,0,0.6);
         }
-
-        .alert-time { color: #ff8888; font-size: 11px; margin-bottom: 8px; }
-        .alert-message { color: #ff4444; font-size: 13px; word-break: break-word; font-weight: bold; }
-        .alert-badge { background: #ff0000; color: white; padding: 2px 10px; border-radius: 12px; font-size: 10px; margin-left: 10px; }
-
+        .alert-time { font-family: 'JetBrains Mono', monospace; color: #ff8888; font-size: 13px; margin-bottom: 8px; }
+        .alert-message { font-family: 'JetBrains Mono', monospace; color: #ff4444; font-size: 14px; word-break: break-word; font-weight: 600; }
+        .alert-badge { font-family: 'Space Grotesk', sans-serif; background: #ff0000; color: white; padding: 2px 10px; border-radius: 12px; font-size: 11px; font-weight: 600; margin-left: 10px; }
         .no-alerts {
             text-align: center;
             padding: 60px;
             color: #336677;
-            font-size: 14px;
+            font-size: 15px;
         }
-
         .sub-tab-bar {
             display: flex;
             gap: 10px;
@@ -575,66 +728,58 @@ HTML = '''
             flex-wrap: wrap;
             justify-content: center;
         }
-
         .sub-tab {
             background: rgba(30,0,10,0.6);
             border: 1px solid rgba(0,217,255,0.2);
             padding: 8px 20px;
             border-radius: 20px;
-            font-family: 'Orbitron', monospace;
-            font-size: 12px;
+            font-family: 'Space Grotesk', sans-serif;
+            font-size: 13px;
+            font-weight: 500;
             cursor: pointer;
             transition: all 0.3s ease;
             color: #00d9ff;
         }
-
         .sub-tab:hover {
             background: rgba(0,217,255,0.1);
         }
-
         .sub-tab.active {
             background: #00d9ff;
             color: #0a1519;
         }
-
         .footer {
             text-align: center;
             margin-top: 25px;
             padding-top: 15px;
             border-top: 1px solid rgba(0,217,255,0.2);
-            font-size: 11px;
+            font-size: 12px;
             color: #447788;
         }
-
         ::-webkit-scrollbar { width: 8px; }
         ::-webkit-scrollbar-track { background: rgba(30,0,10,0.5); border-radius: 10px; }
         ::-webkit-scrollbar-thumb { background: #00d9ff; border-radius: 10px; }
-
         .export-container {
             text-align: center;
             margin-bottom: 25px;
         }
-
         .export-btn {
             background: linear-gradient(135deg, #1a2323, #0f1c1f);
             border: 1px solid #00d9ff;
             color: #00d9ff;
             padding: 12px 35px;
             border-radius: 40px;
-            font-family: 'Orbitron', monospace;
-            font-size: 14px;
-            font-weight: bold;
+            font-family: 'Space Grotesk', sans-serif;
+            font-size: 15px;
+            font-weight: 600;
             transition: all 0.3s ease;
             cursor: pointer;
         }
-
         .export-btn:hover {
             background: #00d9ff;
             color: #0a1519;
             transform: translateY(-2px);
             box-shadow: 0 0 30px rgba(0,217,255,0.5);
         }
-
         .logout-btn {
             position: absolute;
             top: 20px;
@@ -644,21 +789,19 @@ HTML = '''
             color: #ff4444;
             padding: 10px 25px;
             border-radius: 40px;
-            font-family: 'Orbitron', monospace;
-            font-size: 13px;
-            font-weight: bold;
+            font-family: 'Space Grotesk', sans-serif;
+            font-size: 14px;
+            font-weight: 600;
             transition: all 0.3s ease;
             cursor: pointer;
             text-decoration: none;
             display: inline-block;
             z-index: 10;
         }
-
         .logout-btn:hover {
             background: #ff4444;
             color: #0a1519;
         }
-
         .modal {
             display: none;
             position: fixed;
@@ -672,9 +815,7 @@ HTML = '''
             justify-content: center;
             align-items: center;
         }
-
         .modal.active { display: flex; }
-
         .modal-content {
             background: linear-gradient(135deg, #0a1a1f, #051012);
             border: 2px solid #00d9ff;
@@ -683,12 +824,10 @@ HTML = '''
             min-width: 350px;
             animation: modalFade 0.3s ease;
         }
-
         @keyframes modalFade {
             from { opacity: 0; transform: scale(0.9); }
             to { opacity: 1; transform: scale(1); }
         }
-
         .modal-content h3 { color: #00d9ff; text-align: center; margin-bottom: 20px; }
         .checkbox-label {
             display: block;
@@ -705,16 +844,121 @@ HTML = '''
         .export-submit { background: #00d9ff; color: #0a1519; border: none; }
         .close-btn { background: transparent; border: 1px solid #ffaa44; color: #ffaa44; }
         .select-all { margin-bottom: 15px; border-bottom: 1px solid rgba(0,217,255,0.3); padding-bottom: 10px; }
+        .settings-modal-content { min-width: 420px; max-width: 480px; max-height: 85vh; overflow-y: auto; }
+        .settings-grid { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
+        .field-label { display: flex; flex-direction: column; gap: 5px; font-size: 13px; color: #88bbcc; text-transform: uppercase; letter-spacing: 1px; }
+        .field-label input[type="text"], .field-label input[type="password"], .field-label input[type="number"] {
+            background: #0a1519;
+            border: 1px solid #00d9ff;
+            color: #00d9ff;
+            padding: 10px;
+            border-radius: 8px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 13px;
+        }
+        .immediate-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 8px; }
+        .immediate-chk { padding: 8px; font-size: 12px; margin: 0; }
+        .settings-status { text-align: center; font-size: 13px; margin-top: 12px; min-height: 16px; }
+        .settings-status.ok { color: #44ff88; }
+        .settings-status.err { color: #ff4444; }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script>
         let selectedDetectors = { process: false, module: false, file: false, network: false, syscall: false };
         let alertChart = null;
         let severityChart = null;
-
         function openExportModal() { document.getElementById('exportModal').classList.add('active'); }
         function closeExportModal() { document.getElementById('exportModal').classList.remove('active'); }
-
+        function openSettingsModal() {
+            document.getElementById('settingsModal').classList.add('active');
+            document.getElementById('settingsStatus').textContent = '';
+            document.getElementById('settingsStatus').className = 'settings-status';
+            fetch('/api/email-config').then(r => r.json()).then(cfg => {
+                document.getElementById('set_enabled').checked = !!cfg.enabled;
+                document.getElementById('set_smtp_host').value = cfg.smtp_host || '';
+                document.getElementById('set_smtp_port').value = cfg.smtp_port || 587;
+                document.getElementById('set_smtp_username').value = cfg.smtp_username || '';
+                document.getElementById('set_smtp_password').value = '';
+                document.getElementById('set_smtp_password').placeholder = cfg.smtp_password_set ? '•••••••• (leave blank to keep current)' : '(no password set)';
+                document.getElementById('set_from_addr').value = cfg.from_addr || '';
+                document.getElementById('set_to_addrs').value = (cfg.to_addrs || []).join(', ');
+                document.getElementById('set_digest_interval').value = cfg.digest_interval || 60;
+                document.getElementById('set_use_tls').checked = cfg.use_tls !== false;
+                const imm = new Set(cfg.immediate_detectors || []);
+                for (const d of ['process','module','file','network','syscall']) {
+                    document.getElementById(`imm_${d}`).checked = imm.has(d);
+                }
+            }).catch(e => console.error(e));
+        }
+        function closeSettingsModal() { document.getElementById('settingsModal').classList.remove('active'); }
+        function collectSettingsPayload() {
+            const immediate = [];
+            for (const d of ['process','module','file','network','syscall']) {
+                if (document.getElementById(`imm_${d}`).checked) immediate.push(d);
+            }
+            return {
+                enabled: document.getElementById('set_enabled').checked,
+                smtp_host: document.getElementById('set_smtp_host').value,
+                smtp_port: parseInt(document.getElementById('set_smtp_port').value || '587', 10),
+                smtp_username: document.getElementById('set_smtp_username').value,
+                smtp_password: document.getElementById('set_smtp_password').value,
+                use_tls: document.getElementById('set_use_tls').checked,
+                from_addr: document.getElementById('set_from_addr').value,
+                to_addrs: document.getElementById('set_to_addrs').value,
+                digest_interval: parseInt(document.getElementById('set_digest_interval').value || '60', 10),
+                immediate_detectors: immediate,
+            };
+        }
+        function saveSettings() {
+            const status = document.getElementById('settingsStatus');
+            status.textContent = 'Saving...';
+            status.className = 'settings-status';
+            fetch('/api/email-config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(collectSettingsPayload())
+            }).then(r => r.json().then(data => ({ ok: r.ok, data }))).then(({ok, data}) => {
+                if (ok) {
+                    status.textContent = '✅ Settings saved';
+                    status.className = 'settings-status ok';
+                    document.getElementById('set_smtp_password').value = '';
+                    document.getElementById('set_smtp_password').placeholder = data.smtp_password_set ? '•••••••• (leave blank to keep current)' : '(no password set)';
+                } else {
+                    status.textContent = '❌ ' + (data.error || 'Failed to save');
+                    status.className = 'settings-status err';
+                }
+            }).catch(e => {
+                status.textContent = '❌ ' + e;
+                status.className = 'settings-status err';
+            });
+        }
+        function sendTestEmail() {
+            const status = document.getElementById('settingsStatus');
+            status.textContent = 'Sending test email...';
+            status.className = 'settings-status';
+            saveSettingsThenTest();
+        }
+        function saveSettingsThenTest() {
+            const status = document.getElementById('settingsStatus');
+            fetch('/api/email-config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(collectSettingsPayload())
+            }).then(() => fetch('/api/email-test', { method: 'POST' }))
+              .then(r => r.json().then(data => ({ ok: r.ok, data })))
+              .then(({ok, data}) => {
+                if (ok) {
+                    status.textContent = '✅ Test email sent — check your inbox';
+                    status.className = 'settings-status ok';
+                } else {
+                    status.textContent = '❌ ' + (data.error || 'Failed to send test email');
+                    status.className = 'settings-status err';
+                }
+            }).catch(e => {
+                status.textContent = '❌ ' + e;
+                status.className = 'settings-status err';
+            });
+        }
         function toggleSelectAll() {
             const all = document.getElementById('selectAllCheckbox').checked;
             for (let key in selectedDetectors) {
@@ -723,7 +967,6 @@ HTML = '''
                 if (chk) chk.checked = all;
             }
         }
-
         function updateDetector(detector) {
             selectedDetectors[detector] = document.getElementById(`chk_${detector}`).checked;
             const all = Object.values(selectedDetectors).every(v => v === true);
@@ -731,7 +974,6 @@ HTML = '''
             document.getElementById('selectAllCheckbox').checked = all;
             document.getElementById('exportSubmit').disabled = !any;
         }
-
         function submitExport() {
             const selected = [];
             for (let key in selectedDetectors) if (selectedDetectors[key]) selected.push(key);
@@ -739,21 +981,18 @@ HTML = '''
             window.location.href = `/export?detectors=${selected.join(',')}`;
             closeExportModal();
         }
-
         function switchMainTab(tabName, element) {
             document.querySelectorAll('.main-panel').forEach(p => p.classList.remove('active'));
             document.querySelectorAll('.main-tab').forEach(t => t.classList.remove('active'));
             document.getElementById(`panel-${tabName}`).classList.add('active');
             element.classList.add('active');
         }
-
         function switchAlertTab(tabName, element) {
             document.querySelectorAll('.alert-container').forEach(c => c.classList.remove('active'));
             document.querySelectorAll('.sub-tab').forEach(t => t.classList.remove('active'));
             document.getElementById(`alerts-${tabName}`).classList.add('active');
             element.classList.add('active');
         }
-
         function updateDashboard(data) {
             for (let detector in data.counts) {
                 const el = document.getElementById(`stat-${detector}`);
@@ -761,17 +1000,14 @@ HTML = '''
                 const miniEl = document.getElementById(`mini-${detector}`);
                 if (miniEl) miniEl.innerText = data.counts[detector];
             }
-
             const total = Object.values(data.counts).reduce((a,b)=>a+b,0);
             const critical = data.counts.network + data.counts.syscall;
             const high = data.counts.process + data.counts.module;
             const medium = data.counts.file;
-
             document.getElementById('total-threats').innerText = total;
             document.getElementById('critical-threats').innerText = critical;
             document.getElementById('high-threats').innerText = high;
             document.getElementById('medium-threats').innerText = medium;
-
             const barCtx = document.getElementById('alertChart').getContext('2d');
             if (alertChart) {
                 alertChart.data.datasets[0].data = [data.counts.process, data.counts.module, data.counts.file, data.counts.network, data.counts.syscall];
@@ -780,10 +1016,9 @@ HTML = '''
                 alertChart = new Chart(barCtx, {
                     type: 'bar',
                     data: { labels: ['PROCESS', 'MODULE', 'FILE', 'NETWORK', 'SYSCALL'], datasets: [{ label: 'Alert Count', data: [0,0,0,0,0], backgroundColor: '#00d9ff', borderRadius: 8, barPercentage: 0.6 }] },
-                    options: { responsive: true, maintainAspectRatio: true, plugins: { legend: { labels: { color: '#00d9ff', font: { family: 'Orbitron' } } } }, scales: { y: { grid: { color: 'rgba(0,217,255,0.1)' }, ticks: { color: '#00d9ff' } }, x: { ticks: { color: '#00d9ff', font: { family: 'Orbitron' } } } } }
+                    options: { responsive: true, maintainAspectRatio: true, plugins: { legend: { labels: { color: '#00d9ff', font: { family: 'JetBrains Mono' } } } }, scales: { y: { grid: { color: 'rgba(0,217,255,0.1)' }, ticks: { color: '#00d9ff' } }, x: { ticks: { color: '#00d9ff', font: { family: 'JetBrains Mono' } } } } }
                 });
             }
-
             const pieCtx = document.getElementById('severityChart').getContext('2d');
             if (severityChart) {
                 severityChart.data.datasets[0].data = [critical, high, medium];
@@ -792,10 +1027,9 @@ HTML = '''
                 severityChart = new Chart(pieCtx, {
                     type: 'doughnut',
                     data: { labels: ['Critical (Network/Syscall)', 'High (Process/Module)', 'Medium (File)'], datasets: [{ data: [0,0,0], backgroundColor: ['#ff0000', '#ff8c00', '#ffdd44'], borderWidth: 0 }] },
-                    options: { responsive: true, maintainAspectRatio: true, plugins: { legend: { labels: { color: '#00d9ff', font: { family: 'Orbitron' } } } } }
+                    options: { responsive: true, maintainAspectRatio: true, plugins: { legend: { labels: { color: '#00d9ff', font: { family: 'JetBrains Mono' } } } } }
                 });
             }
-
             for (let detector of ['process', 'module', 'file', 'network', 'syscall']) {
                 const container = document.getElementById(`alerts-${detector}`);
                 const alerts = data.alerts[detector];
@@ -812,11 +1046,8 @@ HTML = '''
                 }
             }
         }
-
         function escapeHtml(text) { return text.replace(/[&<>]/g, function(m){if(m==='&') return '&amp;'; if(m==='<') return '&lt;'; if(m==='>') return '&gt;'; return m;}); }
-
         function refresh() { fetch('/api/alerts').then(r=>r.json()).then(data=>updateDashboard(data)).catch(e=>console.error(e)); }
-
         setInterval(refresh, 2000);
         refresh();
     </script>
@@ -824,21 +1055,18 @@ HTML = '''
 <body>
     <div class="bg-animation"></div>
     <a href="/logout" class="logout-btn">🔒 LOGOUT</a>
-
     <div class="header">
         <h1>💀 SENTINEL</h1>
         <div class="subtitle"><span class="status-dot"></span> eBPF Real-Time Rootkit Detection</div>
     </div>
-
     <div class="export-container">
         <button class="export-btn" onclick="openExportModal()">📤 EXPORT ALERTS</button>
+        <button class="export-btn" onclick="openSettingsModal()">✉️ EMAIL ALERTS</button>
     </div>
-
     <div class="main-tab-bar">
         <div class="main-tab active" onclick="switchMainTab('dashboard', this)">📊 SIEM DASHBOARD</div>
         <div class="main-tab" onclick="switchMainTab('alerts', this)">🚨 ALERTS</div>
     </div>
-
     <div id="panel-dashboard" class="main-panel active">
         <div class="stats-grid">
             <div class="stat-card"><div class="stat-icon">📊</div><div class="stat-number" id="total-threats">0</div><div class="stat-label">TOTAL</div></div>
@@ -846,12 +1074,10 @@ HTML = '''
             <div class="stat-card"><div class="stat-icon">🟠</div><div class="stat-number" id="high-threats">0</div><div class="stat-label">HIGH</div></div>
             <div class="stat-card"><div class="stat-icon">🟡</div><div class="stat-number" id="medium-threats">0</div><div class="stat-label">MEDIUM</div></div>
         </div>
-
         <div class="dashboard-grid">
             <div class="dashboard-card"><h3>📈 ALERTS BY DETECTOR</h3><div class="chart-container"><canvas id="alertChart"></canvas></div></div>
             <div class="dashboard-card"><h3>🥧 SEVERITY DISTRIBUTION</h3><div class="chart-container"><canvas id="severityChart"></canvas></div></div>
         </div>
-
         <div class="alert-cards-row">
             <div class="alert-mini-card" onclick="switchMainTab('alerts', document.querySelector('.main-tab:last-child')); setTimeout(()=>{document.querySelector('.sub-tab').click();},100)">
                 <div class="icon">🔍</div><div class="count" id="mini-process">0</div><div class="name">PROCESS</div>
@@ -870,7 +1096,6 @@ HTML = '''
             </div>
         </div>
     </div>
-
     <div id="panel-alerts" class="main-panel">
         <div class="sub-tab-bar">
             <div class="sub-tab active" onclick="switchAlertTab('process', this)">🔍 PROCESS</div>
@@ -879,18 +1104,15 @@ HTML = '''
             <div class="sub-tab" onclick="switchAlertTab('network', this)">🌐 NETWORK</div>
             <div class="sub-tab" onclick="switchAlertTab('syscall', this)">⚙️ SYSCALL</div>
         </div>
-
         <div id="alerts-process" class="alert-container active"><div class="no-alerts">🔒 No threats detected</div></div>
         <div id="alerts-module" class="alert-container"><div class="no-alerts">🔒 No threats detected</div></div>
         <div id="alerts-file" class="alert-container"><div class="no-alerts">🔒 No threats detected</div></div>
         <div id="alerts-network" class="alert-container"><div class="no-alerts">🔒 No threats detected</div></div>
         <div id="alerts-syscall" class="alert-container"><div class="no-alerts">🔒 No threats detected</div></div>
     </div>
-
     <div class="footer">
         <p>SENTINEL v3.0 | eBPF Real-Time Monitoring | Auto-refresh every 2 seconds | Glowing alerts = Active threats</p>
     </div>
-
     <div id="exportModal" class="modal" onclick="if(event.target===this)closeExportModal()">
         <div class="modal-content">
             <h3>📤 SELECT DETECTORS TO EXPORT</h3>
@@ -903,14 +1125,46 @@ HTML = '''
             <div class="modal-buttons"><button class="modal-btn export-submit" id="exportSubmit" onclick="submitExport()" disabled>📥 EXPORT</button><button class="modal-btn close-btn" onclick="closeExportModal()">❌ CANCEL</button></div>
         </div>
     </div>
+    <div id="settingsModal" class="modal" onclick="if(event.target===this)closeSettingsModal()">
+        <div class="modal-content settings-modal-content">
+            <h3>✉️ EMAIL ALERT SETTINGS</h3>
+            <label class="checkbox-label"><input type="checkbox" id="set_enabled"><span>✅ ENABLE EMAIL ALERTS</span></label>
+            <div class="settings-grid">
+                <label class="field-label">SMTP Host<input type="text" id="set_smtp_host" placeholder="smtp.gmail.com"></label>
+                <label class="field-label">SMTP Port<input type="number" id="set_smtp_port" placeholder="587"></label>
+                <label class="field-label">SMTP Username<input type="text" id="set_smtp_username" placeholder="you@gmail.com"></label>
+                <label class="field-label">SMTP Password<input type="password" id="set_smtp_password" placeholder="(unchanged — leave blank to keep current)"></label>
+                <label class="field-label">From Address<input type="text" id="set_from_addr" placeholder="you@gmail.com"></label>
+                <label class="field-label">Send To (comma-separated)<input type="text" id="set_to_addrs" placeholder="you@domain.com, oncall@domain.com"></label>
+                <label class="field-label">Digest Interval (seconds)<input type="number" id="set_digest_interval" placeholder="60"></label>
+                <label class="checkbox-label" style="margin-top:6px;"><input type="checkbox" id="set_use_tls"><span>Use STARTTLS</span></label>
+            </div>
+            <div class="field-label" style="margin-top:10px;">🚨 Send immediately (bypass digest) for:</div>
+            <div class="immediate-row">
+                <label class="checkbox-label immediate-chk"><input type="checkbox" id="imm_process"><span>🔍 Process</span></label>
+                <label class="checkbox-label immediate-chk"><input type="checkbox" id="imm_module"><span>📦 Module</span></label>
+                <label class="checkbox-label immediate-chk"><input type="checkbox" id="imm_file"><span>📁 File</span></label>
+                <label class="checkbox-label immediate-chk"><input type="checkbox" id="imm_network"><span>🌐 Network</span></label>
+                <label class="checkbox-label immediate-chk"><input type="checkbox" id="imm_syscall"><span>⚙️ Syscall</span></label>
+            </div>
+            <div id="settingsStatus" class="settings-status"></div>
+            <div class="modal-buttons">
+                <button class="modal-btn export-submit" onclick="saveSettings()">💾 SAVE</button>
+                <button class="modal-btn" style="background:transparent;border:1px solid #66aacc;color:#66aacc;" onclick="sendTestEmail()">📧 SEND TEST</button>
+                <button class="modal-btn close-btn" onclick="closeSettingsModal()">❌ CLOSE</button>
+            </div>
+        </div>
+    </div>
 </body>
 </html>
 '''
+
 
 @app.route('/')
 @login_required
 def index():
     return render_template_string(HTML)
+
 
 @app.route('/api/alerts')
 @login_required
@@ -919,13 +1173,13 @@ def get_alerts():
         counts = {k: len(v) for k, v in alerts.items()}
         return jsonify({'alerts': alerts, 'counts': counts})
 
+
 @app.route('/export')
 @login_required
 def export_custom():
     detectors_param = request.args.get('detectors', '')
     selected = detectors_param.split(',') if detectors_param else []
     date_str = datetime.now().strftime('%Y%m%d_%H%M%S')
-
     with lock:
         zip_buffer = BytesIO()
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
@@ -942,6 +1196,84 @@ def export_custom():
         zip_buffer.seek(0)
         return send_file(zip_buffer, mimetype='application/zip', as_attachment=True, download_name=f"sentinel_alerts_{date_str}.zip")
 
+
+@app.route('/api/email-config', methods=['GET'])
+@login_required
+def get_email_config_route():
+    cfg = get_email_config()
+    safe = dict(cfg)
+    safe['smtp_password_set'] = bool(cfg.get('smtp_password'))
+    safe.pop('smtp_password', None)  # never send the password back to the browser
+    return jsonify(safe)
+
+
+@app.route('/api/email-config', methods=['POST'])
+@login_required
+def save_email_config_route():
+    data = request.get_json(force=True, silent=True) or {}
+    updates = {}
+
+    if 'enabled' in data:
+        updates['enabled'] = bool(data['enabled'])
+    if 'smtp_host' in data:
+        updates['smtp_host'] = str(data['smtp_host']).strip()
+    if 'smtp_port' in data:
+        try:
+            updates['smtp_port'] = int(data['smtp_port'])
+        except (TypeError, ValueError):
+            return jsonify({'error': 'smtp_port must be a number'}), 400
+    if 'smtp_username' in data:
+        updates['smtp_username'] = str(data['smtp_username']).strip()
+    if 'smtp_password' in data and data['smtp_password']:
+        # blank password field means "leave unchanged" — only overwrite if non-empty
+        updates['smtp_password'] = str(data['smtp_password'])
+    if 'use_tls' in data:
+        updates['use_tls'] = bool(data['use_tls'])
+    if 'from_addr' in data:
+        updates['from_addr'] = str(data['from_addr']).strip()
+    if 'to_addrs' in data:
+        raw = data['to_addrs']
+        if isinstance(raw, str):
+            raw = raw.split(',')
+        updates['to_addrs'] = [a.strip() for a in raw if a.strip()]
+    if 'digest_interval' in data:
+        try:
+            updates['digest_interval'] = max(5, int(data['digest_interval']))
+        except (TypeError, ValueError):
+            return jsonify({'error': 'digest_interval must be a number'}), 400
+    if 'immediate_detectors' in data:
+        raw = data['immediate_detectors']
+        if isinstance(raw, str):
+            raw = raw.split(',')
+        valid = set(alerts.keys())
+        updates['immediate_detectors'] = sorted(set(d.strip() for d in raw if d.strip() in valid))
+
+    new_cfg = update_email_config(updates)
+    safe = dict(new_cfg)
+    safe['smtp_password_set'] = bool(new_cfg.get('smtp_password'))
+    safe.pop('smtp_password', None)
+    return jsonify(safe)
+
+
+@app.route('/api/email-test', methods=['POST'])
+@login_required
+def test_email_route():
+    cfg = get_email_config()
+    if not cfg.get('to_addrs'):
+        return jsonify({'ok': False, 'error': 'No recipient addresses configured. Add at least one and save first.'}), 400
+    if not cfg.get('smtp_username') or not cfg.get('smtp_password'):
+        return jsonify({'ok': False, 'error': 'SMTP username/password missing. Save your settings first.'}), 400
+    err = send_email(
+        "[SENTINEL] Test alert email",
+        f"This is a test email from SENTINEL, sent {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.\n"
+        f"If you received this, email alerting is configured correctly.",
+        cfg=cfg,
+    )
+    if err:
+        return jsonify({'ok': False, 'error': err}), 502
+    return jsonify({'ok': True})
+
+
 if __name__ == '__main__':
     print("="*60)
     print("🛡️ SENTINEL DASHBOARD")
@@ -949,5 +1281,14 @@ if __name__ == '__main__':
     print("[*] Detectors starting automatically...")
     print("[*] Dashboard: http://localhost:5000")
     print("[*] Default login: admin / changeme123 — CHANGE THIS")
+    _cfg = get_email_config()
+    if _cfg.get('enabled'):
+        if _cfg.get('smtp_username') and _cfg.get('smtp_password') and _cfg.get('to_addrs'):
+            print(f"[*] Email alerts: ENABLED -> {', '.join(_cfg['to_addrs'])} via {_cfg['smtp_host']}:{_cfg['smtp_port']}")
+            print(f"[*] Immediate detectors: {', '.join(_cfg.get('immediate_detectors', [])) or 'none'} | Digest every {_cfg.get('digest_interval')}s")
+        else:
+            print("[!] Email alerts: ENABLED but misconfigured — open the dashboard Settings panel to finish setup")
+    else:
+        print("[*] Email alerts: disabled (enable it from the dashboard Settings panel)")
     print("="*60)
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
