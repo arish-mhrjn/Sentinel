@@ -66,7 +66,7 @@ int trace_tcp_close(struct pt_regs *ctx, struct sock *sk) {
 """
 
 # --- CONFIGURATION ---
-DASHBOARD_IP = "192.168.1.70"
+DASHBOARD_IP = "192.168.1.73"
 
 IGNORE_PROCESSES = {
     "ksoftirqd", "swapper", "kworker", "kthreadd", "rcu_sched",
