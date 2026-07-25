@@ -4,8 +4,9 @@ import os
 import time
 from datetime import datetime
 
-LOG_FILE = "/var/log/sentinel/alerts.log"
-os.makedirs("/var/log/sentinel", exist_ok=True)
+LOG_DIR  = "/var/log/sentinel"
+LOG_FILE = os.path.join(LOG_DIR, "alerts.log")
+os.makedirs(LOG_DIR, exist_ok=True)
 
 def log_alert(alert_type, message):
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -42,8 +43,22 @@ SKIP_PREFIXES = (
     '/usr/lib/', '/usr/lib64/', '/usr/share/', '/usr/bin/',
     '/usr/sbin/', '/bin/', '/sbin/', '/etc/ld', '/etc/ssl',
     '/var/cache/', '/var/lib/', '/snap/',
+    # SENTINEL's own state directory. The dashboard rewrites its config here
+    # with the standard atomic write-then-rename dance, which this detector
+    # would otherwise report on itself.
+    LOG_DIR.rstrip('/') + '/',
 )
-SKIP_SUFFIXES = ('.so', '.pyc', '.cache', '.conf', '.log', '.db', '.json')
+
+# Suffixes belonging to files that are transient by construction: an atomic
+# write (write .tmp -> rename over the target), an editor swap file, a partial
+# download. They are supposed to disappear, so "opened but not listed" says
+# nothing about concealment.
+TRANSIENT_SUFFIXES = (
+    '.tmp', '.temp', '.swp', '.swx', '.swo', '.part', '.partial',
+    '.crdownload', '.download', '.new', '.bak', '.lock', '~',
+)
+SKIP_SUFFIXES = ('.so', '.pyc', '.cache', '.conf', '.log', '.db', '.json') \
+                + TRANSIENT_SUFFIXES
 
 MY_PID = os.getpid()
 
@@ -83,6 +98,19 @@ def is_hidden(filepath):
         if basename in os.listdir(directory):
             return False
     except Exception:
+        return False
+
+    # CONFIRM: "open worked but listdir didn't show it" is also what a file
+    # that vanished mid-check looks like. Every atomic write in the system
+    # (write foo.tmp, rename foo.tmp -> foo) opens that path a moment before
+    # unlinking the name, so the open above can succeed and the listdir below
+    # can miss it purely because the rename landed in between — no rootkit
+    # involved. A genuinely hidden file is still reachable by path, because
+    # stat() resolves names directly instead of walking directory entries.
+    # So: if the path is gone now, it was transient, not concealed.
+    try:
+        os.lstat(filepath)
+    except OSError:
         return False
     return True
 
