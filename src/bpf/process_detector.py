@@ -29,6 +29,18 @@ WHITELIST = [
     "file_detector", "network_detector", "syscall_monitor"
 ]
 
+# Thread names seen from browsers/JITs that used to trip the detector. The Tgid
+# check below already covers these generically; this is a cheap second net that
+# also documents what the noise looked like.
+THREAD_NAME_WHITELIST = {
+    "heap helper", "jit worker", "gc marker", "gc task", "js watchdog",
+    "compositor", "renderer", "imagebridgechl", "ipc i/o child", "ipc i/o parent",
+    "dom worker", "domcachethread", "stylethread", "imgdecoder",
+    "mediapdecoder", "mediasupervisor", "audioipc", "backgroundthr",
+    "timer", "socket thread", "streamtrans", "taskcontroller",
+    "threadpoolforeg", "threadpoolback", "chrome_childioT", "memorypoller",
+}
+
 CHECK_INTERVAL = 3
 STRIKE_THRESHOLD = 2
 
@@ -68,8 +80,47 @@ def get_process_name(pid):
     except:
         return "Unknown/Hidden"
 
+def get_tgid(pid):
+    """Return the thread-group id of a task, or None if /proc has no record.
+
+    None means the task really is invisible to procfs. A number means procfs
+    knows about it, even if it isn't listed at the top level of /proc.
+    """
+    try:
+        with open(f"/proc/{pid}/status", "r") as f:
+            for line in f:
+                if line.startswith("Tgid:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+def is_thread(pid):
+    """True if this task is a non-leader thread rather than a process.
+
+    sched_process_fork fires for every clone(), so thread creation lands in the
+    kernel map too. But the top level of /proc only lists thread-group leaders,
+    so every worker thread in the system (browser 'Heap helper' / 'JIT Worker'
+    threads being the noisiest offenders) looks hidden to a naive PID diff.
+    Threads live at /proc/<tgid>/task/<tid>, and their Tgid differs from their
+    own pid -- that is what we key off.
+
+    This does not weaken detection: a rootkit hiding a process by unhooking it
+    from the /proc readdir still leaves Tgid == pid, so it is still flagged.
+    Only tasks the kernel itself reports as belonging to another thread group
+    are dismissed.
+    """
+    tgid = get_tgid(pid)
+    if tgid is None or tgid == pid:
+        return False
+    # Confirm the leader really claims it, so a spoofed status file alone
+    # isn't enough to silence an alert.
+    return os.path.exists(f"/proc/{tgid}/task/{pid}")
+
 def is_whitelisted(pid, name):
     if name in WHITELIST:
+        return True
+    if name.strip().lower() in THREAD_NAME_WHITELIST:
         return True
     if name.startswith("pool-"):
         return True
@@ -111,6 +162,12 @@ try:
         hidden_pids = kernel_pids - visible_pids
 
         for pid in list(hidden_pids):
+            # Worker threads are absent from the top level of /proc by design,
+            # not by concealment. Drop them before anything else.
+            if is_thread(pid):
+                hidden_pids.discard(pid)
+                continue
+
             name = get_process_name(pid)
 
             if is_whitelisted(pid, name):
