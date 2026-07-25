@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SENTINEL | Rootkit Detection Framework</title>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/dashboard.css') }}">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script defer src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+</head>
+<body>
+    <div class="bg-animation"></div>
+    <a href="/logout" class="logout-btn">🔒 LOGOUT</a>
+    <div class="header">
+        <h1>💀 SENTINEL</h1>
+        <div class="subtitle"><span class="status-dot"></span> eBPF Real-Time Rootkit Detection</div>
+    </div>
+    <div class="export-container">
+        <button class="export-btn" onclick="openExportModal()">📤 EXPORT ALERTS</button>
+        <button class="export-btn" onclick="openSettingsModal()">✉️ EMAIL ALERTS</button>
+    </div>
+    <div class="root-warning" id="root-warning" style="display:none;"></div>
+    <div class="health-summary" id="health-summary">CHECKING DETECTOR STATUS…</div>
+    <div class="health-strip" id="health-strip"></div>
+    <div class="detector-errors" id="detector-errors" style="display:none;"></div>
+    <div class="main-tab-bar">
+        <div class="main-tab active" onclick="switchMainTab('dashboard', this)">📊 SIEM DASHBOARD</div>
+        <div class="main-tab" onclick="switchMainTab('alerts', this)">🚨 ALERTS</div>
+        <div class="main-tab" onclick="switchMainTab('correlations', this)">🔗 CORRELATIONS <span id="corr-count">0</span></div>
+    </div>
+    <div id="panel-dashboard" class="main-panel active">
+        <div class="stats-grid">
+            <div class="stat-card"><div class="stat-icon">📊</div><div class="stat-number" id="total-threats">0</div><div class="stat-label">TOTAL</div></div>
+            <div class="stat-card"><div class="stat-icon">🔴</div><div class="stat-number" id="critical-threats">0</div><div class="stat-label">CRITICAL</div></div>
+            <div class="stat-card"><div class="stat-icon">🟠</div><div class="stat-number" id="high-threats">0</div><div class="stat-label">HIGH</div></div>
+            <div class="stat-card"><div class="stat-icon">🟡</div><div class="stat-number" id="medium-threats">0</div><div class="stat-label">MEDIUM</div></div>
+            <div class="stat-card"><div class="stat-icon">🔗</div><div class="stat-number" id="correlated-threats">0</div><div class="stat-label">CORRELATED</div></div>
+        </div>
+        <div class="dashboard-grid">
+            <div class="dashboard-card chart-card-wide">
+                <h3>📉 ALERT ACTIVITY OVER TIME
+                    <select id="timeline-range" onchange="refreshTimeline()" style="float:right;background:#0a1519;border:1px solid rgba(0,217,255,0.35);color:#00d9ff;font-family:'JetBrains Mono',monospace;font-size:12px;padding:4px 8px;border-radius:7px;">
+                        <option value="15">Last 15 min</option>
+                        <option value="30" selected>Last 30 min</option>
+                        <option value="60">Last 1 hour</option>
+                        <option value="360">Last 6 hours</option>
+                        <option value="1440">Last 24 hours</option>
+                    </select>
+                </h3>
+                <div class="chart-container" style="height:260px;"><canvas id="timelineChart"></canvas></div>
+                <div id="timeline-note" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:#ffbe3c;text-align:center;margin-top:6px;"></div>
+            </div>
+            <div class="dashboard-card"><h3>📈 ALERTS BY DETECTOR</h3><div class="chart-container"><canvas id="alertChart"></canvas></div></div>
+            <div class="dashboard-card"><h3>🥧 SEVERITY DISTRIBUTION</h3><div class="chart-container"><canvas id="severityChart"></canvas></div></div>
+        </div>
+        <div class="alert-cards-row">
+            <div class="alert-mini-card" onclick="switchMainTab('alerts', document.querySelector('.main-tab:last-child')); setTimeout(()=>{document.querySelector('.sub-tab').click();},100)">
+                <div class="icon">🔍</div><div class="count" id="mini-process">0</div><div class="name">PROCESS</div>
+            </div>
+            <div class="alert-mini-card" onclick="switchMainTab('alerts', document.querySelector('.main-tab:last-child')); setTimeout(()=>{document.querySelectorAll('.sub-tab')[1].click();},100)">
+                <div class="icon">📦</div><div class="count" id="mini-module">0</div><div class="name">MODULE</div>
+            </div>
+            <div class="alert-mini-card" onclick="switchMainTab('alerts', document.querySelector('.main-tab:last-child')); setTimeout(()=>{document.querySelectorAll('.sub-tab')[2].click();},100)">
+                <div class="icon">📁</div><div class="count" id="mini-file">0</div><div class="name">FILE</div>
+            </div>
+            <div class="alert-mini-card" onclick="switchMainTab('alerts', document.querySelector('.main-tab:last-child')); setTimeout(()=>{document.querySelectorAll('.sub-tab')[3].click();},100)">
+                <div class="icon">🌐</div><div class="count" id="mini-network">0</div><div class="name">NETWORK</div>
+            </div>
+            <div class="alert-mini-card" onclick="switchMainTab('alerts', document.querySelector('.main-tab:last-child')); setTimeout(()=>{document.querySelectorAll('.sub-tab')[4].click();},100)">
+                <div class="icon">⚙️</div><div class="count" id="mini-syscall">0</div><div class="name">SYSCALL</div>
+            </div>
+        </div>
+    </div>
+    <div id="panel-alerts" class="main-panel">
+        <div class="filter-bar">
+            <input type="text" id="filter-q" placeholder="🔍 Search alert type or details (e.g. hidden, 4444, getdents)…" oninput="onFilterChange()">
+            <label for="filter-severity">Severity</label>
+            <select id="filter-severity" onchange="refresh()">
+                <option value="">All</option>
+                <option value="CRITICAL">Critical</option>
+                <option value="HIGH">High</option>
+                <option value="MEDIUM">Medium</option>
+                <option value="LOW">Low</option>
+            </select>
+            <label for="filter-minutes">Time</label>
+            <select id="filter-minutes" onchange="refresh()">
+                <option value="0">All time</option>
+                <option value="5">Last 5 min</option>
+                <option value="15">Last 15 min</option>
+                <option value="60">Last hour</option>
+                <option value="360">Last 6 hours</option>
+                <option value="1440">Last 24 hours</option>
+            </select>
+            <button class="filter-clear" onclick="clearFilters()">✖ CLEAR</button>
+            <div class="filter-result" id="filter-result"></div>
+        </div>
+        <div class="sub-tab-bar">
+            <div class="sub-tab active" onclick="switchAlertTab('process', this)">🔍 PROCESS</div>
+            <div class="sub-tab" onclick="switchAlertTab('module', this)">📦 MODULE</div>
+            <div class="sub-tab" onclick="switchAlertTab('file', this)">📁 FILE</div>
+            <div class="sub-tab" onclick="switchAlertTab('network', this)">🌐 NETWORK</div>
+            <div class="sub-tab" onclick="switchAlertTab('syscall', this)">⚙️ SYSCALL</div>
+        </div>
+        <div id="alerts-process" class="alert-container active"><div class="no-alerts">🔒 No threats detected</div></div>
+        <div id="alerts-module" class="alert-container"><div class="no-alerts">🔒 No threats detected</div></div>
+        <div id="alerts-file" class="alert-container"><div class="no-alerts">🔒 No threats detected</div></div>
+        <div id="alerts-network" class="alert-container"><div class="no-alerts">🔒 No threats detected</div></div>
+        <div id="alerts-syscall" class="alert-container"><div class="no-alerts">🔒 No threats detected</div></div>
+    </div>
+    <div id="panel-correlations" class="main-panel">
+        <div class="filter-result" style="padding:0 4px 14px;">
+            Findings raised when two or more independent detectors agree within a rule window. A single detector can be noisy; several disagreeing with userspace at once is much harder to explain away.
+        </div>
+        <div id="corr-container" class="corr-list"><div class="no-alerts">🔒 No correlated findings yet</div></div>
+    </div>
+    <div class="footer">
+        <p>SENTINEL v3.1 | eBPF Real-Time Monitoring | Alerts 2s · Health 5s · Correlations 5s · Timeline 10s</p>
+    </div>
+    <div id="exportModal" class="modal" onclick="if(event.target===this)closeExportModal()">
+        <div class="modal-content">
+            <h3>📤 SELECT DETECTORS TO EXPORT</h3>
+            <div class="select-all"><label class="checkbox-label"><input type="checkbox" id="selectAllCheckbox" onchange="toggleSelectAll()"><span>✅ SELECT ALL</span></label></div>
+            <label class="checkbox-label"><input type="checkbox" id="chk_process" onchange="updateDetector('process')"><span>🔍 PROCESS DETECTOR</span></label>
+            <label class="checkbox-label"><input type="checkbox" id="chk_module" onchange="updateDetector('module')"><span>📦 MODULE DETECTOR</span></label>
+            <label class="checkbox-label"><input type="checkbox" id="chk_file" onchange="updateDetector('file')"><span>📁 FILE DETECTOR</span></label>
+            <label class="checkbox-label"><input type="checkbox" id="chk_network" onchange="updateDetector('network')"><span>🌐 NETWORK DETECTOR</span></label>
+            <label class="checkbox-label"><input type="checkbox" id="chk_syscall" onchange="updateDetector('syscall')"><span>⚙️ SYSCALL MONITOR</span></label>
+            <div class="modal-buttons"><button class="modal-btn export-submit" id="exportSubmit" onclick="submitExport()" disabled>📥 EXPORT</button><button class="modal-btn close-btn" onclick="closeExportModal()">❌ CANCEL</button></div>
+        </div>
+    </div>
+    <div id="settingsModal" class="modal" onclick="if(event.target===this)closeSettingsModal()">
+        <div class="modal-content settings-modal-content">
+            <h3>✉️ EMAIL ALERT SETTINGS</h3>
+            <label class="checkbox-label"><input type="checkbox" id="set_enabled"><span>✅ ENABLE EMAIL ALERTS</span></label>
+            <div class="settings-grid">
+                <label class="field-label">SMTP Host<input type="text" id="set_smtp_host" placeholder="smtp.gmail.com"></label>
+                <label class="field-label">SMTP Port<input type="number" id="set_smtp_port" placeholder="587"></label>
+                <label class="field-label">SMTP Username<input type="text" id="set_smtp_username" placeholder="you@gmail.com"></label>
+                <label class="field-label">SMTP Password<input type="password" id="set_smtp_password" placeholder="(unchanged — leave blank to keep current)"></label>
+                <label class="field-label">From Address<input type="text" id="set_from_addr" placeholder="you@gmail.com"></label>
+                <label class="field-label">Send To (comma-separated)<input type="text" id="set_to_addrs" placeholder="you@domain.com, oncall@domain.com"></label>
+                <label class="field-label">Digest Interval (seconds)<input type="number" id="set_digest_interval" placeholder="60"></label>
+                <label class="checkbox-label" style="margin-top:6px;"><input type="checkbox" id="set_use_tls"><span>Use STARTTLS</span></label>
+            </div>
+            <div class="field-label" style="margin-top:10px;">🚨 Send immediately (bypass digest) for:</div>
+            <div class="immediate-row">
+                <label class="checkbox-label immediate-chk"><input type="checkbox" id="imm_process"><span>🔍 Process</span></label>
+                <label class="checkbox-label immediate-chk"><input type="checkbox" id="imm_module"><span>📦 Module</span></label>
+                <label class="checkbox-label immediate-chk"><input type="checkbox" id="imm_file"><span>📁 File</span></label>
+                <label class="checkbox-label immediate-chk"><input type="checkbox" id="imm_network"><span>🌐 Network</span></label>
+                <label class="checkbox-label immediate-chk"><input type="checkbox" id="imm_syscall"><span>⚙️ Syscall</span></label>
+            </div>
+            <div id="settingsStatus" class="settings-status"></div>
+            <div class="modal-buttons">
+                <button class="modal-btn export-submit" onclick="saveSettings()">💾 SAVE</button>
+                <button class="modal-btn" style="background:transparent;border:1px solid #66aacc;color:#66aacc;" onclick="sendTestEmail()">📧 SEND TEST</button>
+                <button class="modal-btn close-btn" onclick="closeSettingsModal()">❌ CLOSE</button>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

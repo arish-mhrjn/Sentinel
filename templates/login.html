@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>SENTINEL | Login</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/login.css') }}">
+</head>
+<body>
+<div class="page-wrap">
+<h1 class="login-banner">💀 SENTINEL</h1>
+<div class="box">
+<h2>LOGIN</h2>
+<form method="POST">
+<div class="field">
+<label for="username">Username</label>
+<input type="text" id="username" name="username" placeholder="Enter username" required autofocus>
+</div>
+<div class="field">
+<label for="password">Password</label>
+<input type="password" id="password" name="password" placeholder="Enter password" required>
+</div>
+<button type="submit">LOGIN</button>
+</form>
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
+</div>
+</div>
+</body>
+</html>
